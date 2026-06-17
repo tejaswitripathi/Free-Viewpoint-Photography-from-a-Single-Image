@@ -20,10 +20,20 @@ scene this script:
     3. Deletes the downloaded .blend (and any leftover local dataset/) to free
        disk before the next scene.
 
+Resuming:
+    scene_data.py uploads a completion marker
+    (s3://<S3_BUCKET>/<S3_PREFIX>/<scene>/dataset/_complete.json) once it has
+    rendered and uploaded every sample for a scene. On each run this script
+    skips any scene whose marker already exists, so it can be safely stopped and
+    restarted and will only process scenes with incomplete datasets. Within a
+    scene, scene_data.py also skips individual samples already present in S3, so
+    a scene interrupted midway resumes instead of re-rendering from scratch.
+
 Usage:
-    python generate_dataset.py                 # run every scene found in S3
-    python generate_dataset.py cafe house      # run only the named scenes
+    python generate_dataset.py                 # run every incomplete scene found in S3
+    python generate_dataset.py cafe house      # run only the named scenes (still skips complete ones)
     python generate_dataset.py --keep-local    # don't delete the downloaded blend / leftovers
+    python generate_dataset.py --force         # re-run scenes even if already complete
 """
 
 import argparse
@@ -46,6 +56,11 @@ SCENE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene_d
 # Where scene_data.py writes its renders ("//dataset/" in the blend file
 # resolves to <scene_folder>/dataset/).
 DATASET_SUBDIR = "dataset"
+
+# Marker file scene_data.py uploads to s3://.../<scene>/dataset/ once a scene's
+# dataset is fully rendered and uploaded. Must match COMPLETE_MARKER in
+# scene_data.py.
+COMPLETE_MARKER = "_complete.json"
 
 # S3 location: s3://<bucket>/<prefix>/<scene>/...
 # Must match S3_BUCKET / S3_PREFIX in scene_data.py.
@@ -124,6 +139,24 @@ def discover_scenes():
                 scenes.append(name)
 
     return sorted(scenes)
+
+
+def scene_is_complete(scene):
+    """Return True if the scene already has a completion marker in S3.
+
+    scene_data.py uploads s3://.../<scene>/dataset/_complete.json only after
+    every sample for the scene has been rendered and uploaded, so its presence
+    means the scene's dataset is complete.
+    """
+    s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}/{scene}/{DATASET_SUBDIR}/{COMPLETE_MARKER}"
+
+    result = subprocess.run(
+        ["aws", "s3", "ls", s3_uri],
+        capture_output=True,
+        text=True,
+    )
+
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def find_blend_file(scene_dir):
@@ -224,6 +257,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate the multiview defocus dataset across all Blender scenes.")
     parser.add_argument("scenes", nargs="*", help="Specific scene names to run (default: all scenes found in S3).")
     parser.add_argument("--keep-local", action="store_true", help="Do not delete the downloaded blend / leftover output.")
+    parser.add_argument("--force", action="store_true", help="Re-run scenes even if they already have a completion marker in S3.")
     args = parser.parse_args()
 
     if args.scenes:
@@ -239,13 +273,41 @@ def main():
         print(f"Scene script not found: {SCENE_SCRIPT}")
         sys.exit(1)
 
+    total_requested = len(scenes)
+
+    # Skip scenes whose dataset is already complete in S3 so the run can be
+    # stopped and restarted, only processing scenes with incomplete datasets.
+    if args.force:
+        pending = scenes
+        already_complete = 0
+    else:
+        print("Checking which scenes already have complete datasets in S3...")
+        pending = []
+        already_complete = 0
+        for scene in scenes:
+            if scene_is_complete(scene):
+                already_complete += 1
+                print(f"[{scene}] Dataset already complete in S3, skipping.")
+            else:
+                pending.append(scene)
+
+    if not pending:
+        print("\nAll requested scenes already have complete datasets. Nothing to do.")
+        return
+
+    scenes = pending
+
     print(f"Blender: {BLENDER}")
     print(f"Scene script: {SCENE_SCRIPT}")
     print(f"Scenes to process ({len(scenes)}): {', '.join(scenes)}")
 
     failures = []
 
-    for scene in scenes:
+    # Scenes already complete in S3 count toward overall progress.
+    completed = already_complete
+
+    for i, scene in enumerate(scenes, start=1):
+        print(f"\n[{completed}/{total_requested} completed] Starting scene {i}/{len(scenes)} this run: {scene}")
         try:
             blend_file = download_blend(scene)
 
@@ -254,7 +316,8 @@ def main():
             if not args.keep_local:
                 delete_local_files(scene, blend_file)
 
-            print(f"[{scene}] Done.")
+            completed += 1
+            print(f"[{scene}] Done. ({completed}/{total_requested} scenes complete)")
 
         except subprocess.CalledProcessError as e:
             print(f"[{scene}] FAILED (exit code {e.returncode}). Keeping local files.")
@@ -264,6 +327,7 @@ def main():
             failures.append(scene)
 
     print("\n========================================")
+    print(f"Completed {completed}/{total_requested} scenes.")
     if failures:
         print(f"Completed with failures in: {', '.join(failures)}")
         sys.exit(1)

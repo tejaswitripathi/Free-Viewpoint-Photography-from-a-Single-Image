@@ -71,6 +71,64 @@ def upload_and_cleanup(folder):
         print(f"Upload failed for {local}, keeping local copy: {e}")
 
 
+# Marker file uploaded to s3://.../<scene>/dataset/ once every sample for the
+# scene has been rendered and uploaded. Its presence means the scene's dataset
+# is complete; generate_dataset.py uses it to skip already-finished scenes.
+COMPLETE_MARKER = "_complete.json"
+
+
+def s3_existing_samples():
+    """Return the set of sample folder names already uploaded for this scene.
+
+    Used to resume an interrupted run: any sample directory that already lives
+    under s3://.../<scene>/dataset/ is skipped instead of being re-rendered.
+    """
+    s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}/{scene_name}/dataset/"
+
+    try:
+        result = subprocess.run(
+            ["aws", "s3", "ls", s3_uri],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Prefix doesn't exist yet (fresh scene) or aws unavailable.
+        return set()
+
+    names = set()
+    for line in result.stdout.splitlines():
+        # Directory lines look like: "                           PRE img_00000.../"
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "PRE":
+            names.add(parts[1].rstrip("/"))
+
+    return names
+
+
+def write_completion_marker(num_samples):
+    """Upload the completion marker so this scene is treated as fully done."""
+    local_marker = bpy.path.abspath(os.path.join(datadir, COMPLETE_MARKER))
+    s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}/{scene_name}/dataset/{COMPLETE_MARKER}"
+
+    ensure_dir(datadir)
+    with open(local_marker, "w") as f:
+        json.dump(
+            {"scene_name": scene_name, "num_samples": num_samples, "complete": True},
+            f,
+            indent=2,
+        )
+
+    try:
+        subprocess.run(["aws", "s3", "cp", local_marker, s3_uri], check=True)
+        print(f"Wrote completion marker -> {s3_uri}")
+    except Exception as e:
+        print(f"Failed to upload completion marker: {e}")
+    finally:
+        if os.path.isfile(local_marker):
+            os.remove(local_marker)
+
+
 def object_world_center(obj):
     corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
     return sum(corners, Vector()) / 8
@@ -412,6 +470,12 @@ ensure_dir(datadir)
 
 img_i = 0
 
+# Samples already present in S3 (from a previous, interrupted run) so we can
+# resume without re-rendering work that's already uploaded.
+existing_samples = s3_existing_samples()
+if existing_samples:
+    print(f"Found {len(existing_samples)} sample(s) already in S3; will skip those.")
+
 depth_bins = make_adaptive_depth_bins(num_bins=10)
 
 for start, end in depth_bins:
@@ -435,10 +499,17 @@ for start, end in depth_bins:
         curr_focus_distance
     )
 
-    folder = os.path.join(
-        datadir,
+    sample_name = (
         f"img_{img_i:05d}_f{f_stop}_fl{focal_length:.1f}_fd{curr_focus_distance:.2f}"
     )
+
+    # Resume support: this sample was uploaded on a previous run, skip it.
+    if sample_name in existing_samples:
+        print(f"Skipping already-uploaded sample {sample_name}")
+        img_i += 1
+        continue
+
+    folder = os.path.join(datadir, sample_name)
 
     source_dir = os.path.join(folder, "source")
     targets_dir = os.path.join(folder, "targets")
@@ -570,5 +641,9 @@ for start, end in depth_bins:
     img_i += 1
 
 restore_camera_pose(camera, base_camera_pose)
+
+# Every sample for this scene has been rendered and uploaded; mark the scene
+# complete so generate_dataset.py skips it on subsequent runs.
+write_completion_marker(img_i)
 
 print("Done.")
