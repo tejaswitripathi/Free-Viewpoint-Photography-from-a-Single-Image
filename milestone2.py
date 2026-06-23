@@ -14,7 +14,7 @@ import open3d as o3d
 import OpenEXR
 
 
-S3_URI = "s3://tejas-blender-bucket/defocus-dataset/cafe/dataset/img_00000_f1.2_fl50.0_fd6.06/"
+S3_URI = "s3://tejas-blender-bucket/defocus-dataset-multiview/bedroom/dataset/img_00000_f2.799999952316284_fl50.0_fd2.77/source/"
 
 
 # -----------------------------
@@ -282,6 +282,28 @@ def print_controls():
     print("  Q / E : larger backward / forward step")
     print()
 
+def points_to_gaussians(points, colors):
+    N = len(points)
+
+    d = np.linalg.norm(points, axis=1)
+
+    s = 0.01 * d
+
+    scales = np.stack([s,s,s], axis=1)
+
+    opacity = np.ones((N, 1), dtype=np.float32)
+
+    rotation = np.zeros((N, 4), dtype=np.float32)
+    rotation[:, 0] = 1.0  # identity quaternion
+
+    return {
+        "position": points,
+        "color": colors,
+        "scale": scales,
+        "opacity": opacity,
+        "rotation": rotation,
+    }
+
 
 # -----------------------------
 # Main
@@ -292,7 +314,7 @@ if __name__ == "__main__":
         print("Downloading sample...")
         download_s3_prefix(S3_URI, data_dir)
 
-        rgb = load_rgb(os.path.join(data_dir, "defocused.png"))
+        rgb = load_rgb(os.path.join(data_dir, "_compositor_dummy.png"))
         depth = load_depth(find_depth_file(data_dir))
 
         with open(os.path.join(data_dir, "metadata.json"), "r") as f:
@@ -319,6 +341,16 @@ if __name__ == "__main__":
             colors,
             voxel_size=0.0,
             estimate_normals=True,
+        )
+
+        gaussians = points_to_gaussians(points, colors)
+
+        print("Gaussians:", len(gaussians["position"]))
+        print("Mean scale:", gaussians["scale"].mean())
+
+        np.savez(
+            "sample.npz",
+            **gaussians,
         )
 
         visualize_interactive(
