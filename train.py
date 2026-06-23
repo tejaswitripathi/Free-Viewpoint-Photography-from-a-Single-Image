@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, random_split
+from torchvision.utils import save_image
 
 from data_preprocessing import DEFAULT_BUCKET, DEFAULT_S3_PREFIX, FreeViewpointDataset
 from models.UNet import UNet
@@ -265,6 +266,8 @@ def main():
 
     checkpoint_dir = Path(args.checkpoint_dir)
     best_path = checkpoint_dir / "best_unet_splat.pth"
+    debug_dir = Path("debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -302,7 +305,7 @@ def main():
         val_loss = 0.0
 
         with torch.no_grad():
-            for batch in val_loader:
+            for batch_idx, batch in enumerate(val_loader):
                 assert_finite_batch(batch)
                 batch = {
                     key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
@@ -311,6 +314,19 @@ def main():
                 outputs = model(batch["input"])
                 prediction = differentiable_splat_render(batch, outputs)
                 val_loss += criterion(prediction, batch["target"]).item()
+
+                if batch_idx == 0:
+                    save_image(
+                        torch.cat(
+                            [
+                                batch["source_rgb"][0],
+                                prediction[0],
+                                batch["target"][0],
+                            ],
+                            dim=2,
+                        ),
+                        debug_dir / f"epoch_{epoch + 1:04d}.png",
+                    )
 
         avg_val_loss = val_loss / max(1, len(val_loader))
         scheduler.step(avg_val_loss)
