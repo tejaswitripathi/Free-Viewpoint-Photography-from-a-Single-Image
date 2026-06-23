@@ -121,10 +121,10 @@ def differentiable_splat_render(batch, outputs, background=1.0):
 
     color = torch.clamp(source_rgb + outputs["color_residual"], 0.0, 1.0)
     radius_gain = torch.exp(outputs["radius_delta"]).clamp(0.25, 4.0)
-    alpha = (outputs["opacity"] * radius_gain).clamp(0.0, 0.995)
+    alpha_gain = (outputs["opacity"] * radius_gain).clamp(0.0, 0.995)
 
     flat_color = color.permute(0, 2, 3, 1).reshape(bsz, height * width, 3)
-    flat_alpha = alpha[:, 0].reshape(bsz, height * width)
+    flat_alpha = alpha_gain[:, 0].reshape(bsz, height * width)
     flat_valid = in_front.reshape(bsz, height * width)
     flat_u = u.reshape(bsz, height * width)
     flat_v = v.reshape(bsz, height * width)
@@ -284,6 +284,8 @@ def main():
                 prediction = differentiable_splat_render(batch, outputs)
                 loss = criterion(prediction, batch["target"])
                 loss = loss + 0.02 * F.l1_loss(outputs["color_residual"], torch.zeros_like(outputs["color_residual"]))
+                loss += 0.001 * outputs["opacity"].mean()
+                loss += 0.001 * torch.mean(outputs["radius_delta"] ** 2)
 
             if torch.isnan(loss) or torch.isinf(loss):
                 raise RuntimeError(f"Non-finite loss at epoch {epoch + 1}, batch {batch_idx}")
