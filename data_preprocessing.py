@@ -81,16 +81,21 @@ class FreeViewpointDataset(Dataset):
         self.s3 = None
         self.samples = []
 
+        # Index local data/cache first so already-downloaded files can be reused.
+        # Important: do NOT stop here if the cache contains only a partial dataset.
+        # The old version only indexed S3 when self.samples was empty, so a cache
+        # with one downloaded pair caused training to see exactly one pair.
         if self.local_dataset_dir:
             self.samples.extend(self._index_local_dataset(self.local_dataset_dir))
 
-        if not self.samples:
-            cache_root = self.local_cache_dir / self.s3_prefix
-            if cache_root.exists():
-                self.samples.extend(self._index_local_dataset(cache_root))
+        cache_root = self.local_cache_dir / self.s3_prefix
+        if cache_root.exists():
+            self.samples.extend(self._index_local_dataset(cache_root))
 
-        if not self.samples and self.use_s3:
+        if self.use_s3:
             self.samples.extend(self._index_s3_dataset())
+
+        self.samples = self._dedupe_samples(self.samples)
 
         if max_samples is not None:
             self.samples = self.samples[: int(max_samples)]
@@ -109,6 +114,33 @@ class FreeViewpointDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def _sample_identity(self, sample):
+        return (
+            sample.get("scene"),
+            sample.get("sample_name"),
+            sample.get("target_name"),
+        )
+
+    def _dedupe_samples(self, samples):
+        """Remove duplicate source/target pairs.
+
+        This lets us index both the local cache and S3 without seeing the same
+        pair twice. Prefer local samples over S3 samples because they are already
+        materialized on disk.
+        """
+        by_id = {}
+        for sample in samples:
+            ident = self._sample_identity(sample)
+            if ident not in by_id:
+                by_id[ident] = sample
+                continue
+
+            existing = by_id[ident]
+            if existing.get("kind") != "local" and sample.get("kind") == "local":
+                by_id[ident] = sample
+
+        return list(by_id.values())
 
     def _scene_allowed(self, scene):
         return self.scenes is None or scene in self.scenes
